@@ -37,6 +37,7 @@ import json
 import logging
 import os
 import re
+import secrets
 import threading
 import time
 import uuid
@@ -45,7 +46,7 @@ import zipfile
 from fastapi import Body, Depends, FastAPI, Header, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import (FileResponse, HTMLResponse, JSONResponse,
-                               Response, StreamingResponse)
+                               RedirectResponse, Response, StreamingResponse)
 from pydantic import model_validator, BaseModel, Field, SecretStr, field_validator
 
 from config import CFG
@@ -56,6 +57,8 @@ from engine import (ESSENTIAL_COOKIES, MAX_REFERENCE_IMAGE_BYTES,
 from engine import MuseProxyError
 from store import Store, account_expiry, min_expiry
 from proxy import normalize_server, request_proxy_context, split_proxy_url
+from storage import MediaStorage, safe_name
+from access import AccessVerifier
 
 import sys
 log = logging.getLogger("muse2api")
@@ -86,6 +89,12 @@ app.add_middleware(CORSMiddleware,
 
 store = Store(CFG)
 engine = MuseEngine(CFG)
+# 生成媒体存储：本地 data/media，可选同步到 S3 兼容对象存储（R2/S3）
+media_store = MediaStorage(CFG.media_dir)
+# 管理后台可放在 Cloudflare Access 后面：验证其签发的 JWT 后免填 API Key
+access = AccessVerifier()
+# Key 由部署环境变量统一管理时（例如 Dokploy 注入、下游项目共用），禁止在后台轮换
+KEY_LOCKED = os.environ.get("MUSE2API_KEY_LOCKED", "").strip() == "1"
 engine.proxy_resolver = lambda aid: (store.get_account(aid) or {}).get("proxy")
 
 
@@ -317,16 +326,25 @@ def resolve_model(name: str | None, default: str = "muse-image") -> str:
 
 
 # ------------------------- 鉴权 -------------------------
-def auth(authorization: str | None = Header(default=None)):
-    if not CFG.api_key:
-        return True
+def _bearer_ok(authorization: str | None) -> bool:
     if not authorization or not authorization.lower().startswith("bearer "):
-        raise HTTPException(401, "缺少 Authorization: Bearer <key>")
+        return False
     parts = authorization.split(None, 1)
     token = parts[1].strip() if len(parts) > 1 else ""
-    if not token or token != CFG.api_key:
-        raise HTTPException(401, "API key 无效")
-    return True
+    return bool(token) and secrets.compare_digest(token, CFG.api_key)
+
+
+def auth(request: Request, authorization: str | None = Header(default=None)):
+    """API Key，或经过签名校验的 Cloudflare Access 登录（仅允许列表中的邮箱）。"""
+    if not CFG.api_key:
+        return True
+    if _bearer_ok(authorization):
+        return True
+    if access.email_from_request(request.headers, request.cookies):
+        return True
+    if not authorization:
+        raise HTTPException(401, "缺少 Authorization: Bearer <key>")
+    raise HTTPException(401, "API key 无效")
 
 
 # ------------------------- 请求模型 -------------------------
@@ -1177,6 +1195,7 @@ def _run_generation_locked(prompt: str, kind: str, timeout: int,
                                       reference_image=reference_image, **engine_kwargs)
                 store.mark(cur_acc["id"], True, "")
                 _sync_cookies(cur_acc["id"])
+                media_store.publish(res.get("path"), res.get("filename"))
                 return res, cur_acc["id"]
             except MuseAuthError as exc:
                 last_exc = exc
@@ -1831,12 +1850,15 @@ async def responses_api(req: ResponsesRequest, _=Depends(auth)):
 
 @app.get("/v1/media/{name}")
 def get_media(name: str):
-    if "/" in name or "\\" in name or ".." in name:
+    if not safe_name(name):
         raise HTTPException(400, "非法文件名")
     p = os.path.join(CFG.media_dir, name)
-    if not os.path.isfile(p):
-        raise HTTPException(404, "文件不存在")
-    return FileResponse(p)
+    if os.path.isfile(p):
+        return FileResponse(p)
+    # 本地缓存已清理：跳转到对象存储（公开域名或短期预签名地址）
+    if media_store.enabled and media_store.remote_exists(name):
+        return RedirectResponse(media_store.remote_url(name), status_code=302)
+    raise HTTPException(404, "文件不存在")
 
 
 # ------------------------- 管理：总览 -------------------------
@@ -1847,8 +1869,9 @@ def admin_status(_=Depends(auth)):
         "accounts": store.list_accounts(),
         "stats": store.stats(),
         "tasks": store.list_tasks(20),
-        "media_count": len(os.listdir(CFG.media_dir))
-        if os.path.isdir(CFG.media_dir) else 0,
+        "media_count": len(media_store.list_all()) if media_store.enabled
+        else (len(os.listdir(CFG.media_dir)) if os.path.isdir(CFG.media_dir) else 0),
+        "storage": media_store.describe(),
         "browser_running": bool(engine.proc and engine.proc.poll() is None),
         "essential_cookies": list(ESSENTIAL_COOKIES),
         "base_url": f"{base}/v1" if base else "",
@@ -2147,15 +2170,29 @@ def _public_base() -> str:
 def get_apikey(_=Depends(auth)):
     base = _public_base()
     base_url = f"{base}/v1" if base else ""
-    return {"api_key": CFG.api_key, "base_url": base_url,
+    return {"api_key": CFG.api_key, "base_url": base_url, "key_locked": KEY_LOCKED,
             "models_url": f"{base}/v1/models" if base else "",
             "media_url": f"{base}/v1/media/{{name}}" if base else "/v1/media/{name}"}
+
+
+@app.get("/admin/session")
+def admin_session(request: Request, authorization: str | None = Header(default=None)):
+    """管理页启动时调用：告诉前端当前是否已登录、通过哪种方式。不需要鉴权。"""
+    email = access.email_from_request(request.headers, request.cookies)
+    if email:
+        return {"authenticated": True, "via": "cloudflare-access", "email": email,
+                "key_locked": KEY_LOCKED}
+    ok = (not CFG.api_key) or _bearer_ok(authorization)
+    return {"authenticated": ok, "via": "api-key" if ok else None,
+            "access_enabled": access.enabled, "key_locked": KEY_LOCKED}
 
 
 @app.post("/admin/apikey/rotate")
 def rotate_apikey(_=Depends(auth)):
     """生成新的 API Key，写入 .env 并立即生效（不用重启）。"""
-    import secrets
+    if KEY_LOCKED:
+        raise HTTPException(409, "API Key 由服务器环境变量统一管理（MUSE2API_KEY_LOCKED=1），"
+                                 "请在部署平台中修改 MUSE2API_KEY 后重新部署")
     new_key = "m2a_" + secrets.token_hex(24)
     old = CFG.api_key
     CFG.api_key = new_key
@@ -2259,19 +2296,8 @@ def clear_tasks(payload: dict = Body(default={}), _=Depends(auth)):
 
 @app.get("/admin/media")
 def admin_media(_=Depends(auth)):
-    d = CFG.media_dir
-    items = []
-    if os.path.isdir(d):
-        for name in os.listdir(d):
-            p = os.path.join(d, name)
-            if not os.path.isfile(p):
-                continue
-            ext = os.path.splitext(name)[1].lower()
-            items.append({"name": name, "url": media_url(name), "bytes": os.path.getsize(p),
-                          "mtime": int(os.path.getmtime(p)),
-                          "kind": "video" if ext in (".mp4", ".webm", ".mov") else "image"})
-    items.sort(key=lambda x: x["mtime"], reverse=True)
-    return {"media": items, "count": len(items)}
+    items = [{**it, "url": media_url(it["name"])} for it in media_store.list_all()]
+    return {"media": items, "count": len(items), "storage": media_store.describe()}
 
 
 @app.post("/admin/media/delete")
@@ -2281,35 +2307,32 @@ def delete_media(payload: dict = Body(default={}), _=Depends(auth)):
         names = [names]
     if not isinstance(names, list):
         raise HTTPException(400, "names 必须是文件名数组")
-    d = CFG.media_dir
     removed = 0
     errors = []
     for name in names:
-        if not isinstance(name, str) or "/" in name or "\\" in name or ".." in name:
+        if not isinstance(name, str) or not safe_name(name):
             errors.append(f"非法文件名: {name}")
             continue
-        p = os.path.join(d, name)
-        if os.path.isfile(p):
-            try:
-                os.remove(p)
+        try:
+            if media_store.delete(name):
                 removed += 1
-            except OSError as e:
-                errors.append(f"{name}: {str(e)}")
+        except Exception as e:  # noqa: BLE001
+            errors.append(f"{name}: {str(e)}")
     return {"removed": removed, "errors": errors}
 
 
 @app.delete("/admin/media/{name}")
 def delete_single_media(name: str, _=Depends(auth)):
-    if "/" in name or "\\" in name or ".." in name:
+    if not safe_name(name):
         raise HTTPException(400, "非法文件名")
-    p = os.path.join(CFG.media_dir, name)
-    if not os.path.isfile(p):
-        raise HTTPException(404, "文件不存在")
     try:
-        os.remove(p)
-        return {"status": "ok", "deleted": name}
-    except OSError as e:
+        if not media_store.delete(name):
+            raise HTTPException(404, "文件不存在")
+    except HTTPException:
+        raise
+    except Exception as e:  # noqa: BLE001
         raise HTTPException(500, f"删除失败: {e}")
+    return {"status": "ok", "deleted": name}
 
 
 # ------------------------- 前端页面 -------------------------
@@ -2848,6 +2871,9 @@ async def _startup():
         _persist_env("MUSE2API_KEY", new_key)
         log.info("🔑 未检测到 MUSE2API_KEY，已自动生成初始密钥: %s", new_key)
     asyncio.create_task(_keepalive_loop())
+    media_store.start_maintenance()
+    if media_store.enabled:
+        log.info("🪣 媒体对象存储已启用: %s", media_store.describe())
 
 
 @app.on_event("shutdown")

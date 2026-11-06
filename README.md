@@ -334,6 +334,41 @@ curl -X POST "http://localhost:18610/v1/images/edits" \
 
 ---
 
+## 🔐 Cloudflare Access 登录（可选）
+
+把管理后台放在 [Cloudflare Access](https://developers.cloudflare.com/cloudflare-one/applications/) 后面后，配置下面三项，
+允许列表中的邮箱登录 Cloudflare 后打开管理页即可使用，**无需在浏览器里填 API Key**：
+
+| 变量 | 说明 |
+|---|---|
+| `MUSE2API_ACCESS_TEAM_DOMAIN` | 团队域名，如 `yourteam.cloudflareaccess.com` |
+| `MUSE2API_ACCESS_AUD` | Access 应用的 Application Audience (AUD) Tag |
+| `MUSE2API_ACCESS_ALLOWED_EMAILS` | 允许的邮箱，逗号分隔 |
+| `MUSE2API_KEY_LOCKED` | 设为 `1` 时 Key 只能通过环境变量修改，后台「重新生成」被禁用 |
+
+- 服务端会**校验 JWT 签名**、audience、issuer 与过期时间，并核对邮箱；绕过 Cloudflare 直连服务器伪造请求头无效
+- 三项任一为空时功能关闭，只接受 API Key
+- API 调用方（以及浏览器扩展导入账号）照常使用 `Authorization: Bearer <key>`；扩展用的 `/admin/accounts` 需要在 Access 中设为 Bypass
+
+## 🪣 媒体对象存储（S3 / Cloudflare R2）
+
+默认生成的图片和视频只保存在 `data/media`。设置 `MUSE2API_STORAGE=s3` 后会同步到任意 S3 兼容的对象存储：
+
+| 变量 | 说明 |
+|---|---|
+| `MUSE2API_STORAGE` | `local`（默认）或 `s3` |
+| `MUSE2API_S3_ENDPOINT` | R2：`https://<account_id>.r2.cloudflarestorage.com`；AWS S3 留空 |
+| `MUSE2API_S3_REGION` | R2 用 `auto`；AWS 填实际区域 |
+| `MUSE2API_S3_BUCKET` | bucket 名称 |
+| `MUSE2API_S3_ACCESS_KEY_ID` / `MUSE2API_S3_SECRET_ACCESS_KEY` | 访问凭据 |
+| `MUSE2API_S3_PREFIX` | 对象前缀，默认 `media/` |
+| `MUSE2API_S3_PUBLIC_BASE` | 可选，bucket 的公开访问域名；不填则使用 1 小时有效的预签名地址 |
+| `MUSE2API_LOCAL_CACHE_HOURS` | 本地缓存保留小时数，默认 72；`0` 表示永久保留 |
+
+- 生成完成后在后台上传，不影响接口响应；启动时会把本地已有的文件补传上去
+- `GET /v1/media/{name}` 本地缓存命中直接返回，否则 302 跳转到对象存储
+- 管理后台的媒体列表、删除同时覆盖本地和对象存储
+
 ## 🎞️ 参考素材：图片 / 视频 / 音频 / 文档
 
 生图、图像编辑、图片任务与视频接口都可以附带参考素材，限制与 muse.ai 网页端一致：

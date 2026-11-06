@@ -223,7 +223,7 @@
       <span class="keybox" id="keyBox">
         <span class="lbl" id="keyLbl">API Key</span>
         <input id="key" type="password" placeholder="粘贴 m2a_ 开头的密钥" autocomplete="off">
-        <button class="ghost mini" onclick="saveKey()">保存</button>
+        <button class="ghost mini" id="keySave" onclick="saveKey()">保存</button>
       </span>
       <select id="langSel" class="langsel" data-no-i18n onchange="setLang(this.value)" title="Language / 语言">
         <option value="zh">中文</option>
@@ -314,7 +314,7 @@
             <input type="text" id="inKey" readonly>
             <button class="ghost mini" onclick="toggleKey()" id="keyEye">显示</button>
             <button class="ghost mini" onclick="copyKey()">复制</button>
-            <button class="danger mini" onclick="rotateKey()">重新生成</button>
+            <button class="danger mini" id="rotateBtn" onclick="rotateKey()">重新生成</button>
           </div>
         </div>
       </div>
@@ -1046,6 +1046,9 @@ const I18N_EN = {
   "✓ 已登录": "✓ Logged in",
   "API Key 必填": "API Key required",
   "已清除 API Key": "API Key cleared",
+  "登录已过期，请刷新页面重新登录": "Session expired, please reload the page to sign in again",
+  "已通过 Cloudflare Access 登录，API Key 由服务器管理": "Signed in with Cloudflare Access; the API key is managed by the server",
+  "API Key 由服务器环境变量统一管理，请在部署平台修改 MUSE2API_KEY": "The API key is managed by server environment variables; change MUSE2API_KEY on your deployment platform",
   "API Key 已保存到本机浏览器，下次打开自动带上": "API Key saved in this browser; it will be used automatically next time",
   "API Key 未填写或填写错误": "API Key is missing or incorrect",
   "请求参数有误 (HTTP 400)，请检查输入内容": "Invalid request parameters (HTTP 400); please check your input",
@@ -1428,6 +1431,34 @@ $('dBase').textContent = location.origin + '/v1';
 
 /* 登录状态：控制提示条和 Key 输入框高亮 */
 let authOK = null;
+/* 服务器端会话：通过 Cloudflare Access 登录时由服务器校验身份，不需要在浏览器里填 Key */
+let SESSION = null;
+async function detectSession(){
+  try{
+    const headers = KEY ? {'Authorization': 'Bearer ' + KEY} : {};
+    const r = await fetch('/admin/session', {headers});
+    SESSION = r.ok ? await r.json() : null;
+  }catch(e){ SESSION = null; }
+  if (SESSION && SESSION.via === 'cloudflare-access'){
+    // 旧版本存在浏览器里的 Key 不再需要，清掉避免混淆
+    KEY = '';
+    try { localStorage.removeItem(KEY_STORE); } catch(e){}
+    $('key').style.display = 'none';
+    $('keySave').style.display = 'none';
+    authOK = null; setAuth(true);
+    $('keyLbl').textContent = '✓ ' + SESSION.email;
+    $('keyBox').title = '已通过 Cloudflare Access 登录，API Key 由服务器管理';
+  }
+  applyKeyLock(SESSION && SESSION.key_locked);
+}
+function applyKeyLock(locked){
+  const b = $('rotateBtn');
+  if (!b || !locked) return;
+  b.disabled = true;
+  b.title = 'API Key 由服务器环境变量统一管理，请在部署平台修改 MUSE2API_KEY';
+}
+const viaAccess = () => !!(SESSION && SESSION.via === 'cloudflare-access');
+
 function setAuth(ok){
   if (authOK === ok) return;
   authOK = ok;
@@ -1458,11 +1489,12 @@ function toast(msg, kind){
 async function api(path, opts){
   opts = opts || {};
   opts.headers = Object.assign({'Content-Type':'application/json'}, opts.headers || {});
-  if (KEY) opts.headers['Authorization'] = 'Bearer ' + KEY;
+  if (KEY && !viaAccess()) opts.headers['Authorization'] = 'Bearer ' + KEY;
   const r = await fetch(path, opts);
   const txt = await r.text();
   let data; try { data = JSON.parse(txt); } catch(e){ data = null; }
   if (r.status === 401){
+    if (viaAccess()) throw new Error('登录已过期，请刷新页面重新登录');
     setAuth(false);
     throw new Error('API Key 未填写或填写错误');
   }
@@ -1550,6 +1582,7 @@ async function loadApikey(){
   try{
     const d = await api('/admin/apikey');
     realKey = d.api_key || '';
+    applyKeyLock(d.key_locked);
     $('inBase').value = d.base_url || (location.origin + '/v1');
     renderKey();
     fillExtFields(d.base_url);
@@ -2368,7 +2401,7 @@ async function loadStatus(){
 
 function refreshAll(){ loadStatus(); loadPool(); loadApikey(); loadRepoStatus(false); }
 
-refreshAll();
+detectSession().finally(refreshAll);
 setInterval(() => {
   loadStatus(); loadPool();
   if ($('tab-tasks').classList.contains('active')) loadTasks();
