@@ -334,6 +334,25 @@ curl -X POST "http://localhost:18610/v1/images/edits" \
 
 ---
 
+## 🪣 媒体对象存储（S3 / Cloudflare R2）
+
+默认生成的图片和视频只保存在 `data/media`。设置 `MUSE2API_STORAGE=s3` 后会同步到任意 S3 兼容的对象存储：
+
+| 变量 | 说明 |
+|---|---|
+| `MUSE2API_STORAGE` | `local`（默认）或 `s3` |
+| `MUSE2API_S3_ENDPOINT` | R2：`https://<account_id>.r2.cloudflarestorage.com`；AWS S3 留空 |
+| `MUSE2API_S3_REGION` | R2 用 `auto`；AWS 填实际区域 |
+| `MUSE2API_S3_BUCKET` | bucket 名称 |
+| `MUSE2API_S3_ACCESS_KEY_ID` / `MUSE2API_S3_SECRET_ACCESS_KEY` | 访问凭据 |
+| `MUSE2API_S3_PREFIX` | 对象前缀，默认 `media/` |
+| `MUSE2API_S3_PUBLIC_BASE` | 可选，bucket 的公开访问域名；不填则使用 1 小时有效的预签名地址 |
+| `MUSE2API_LOCAL_CACHE_HOURS` | 本地缓存保留小时数，默认 72；`0` 表示永久保留 |
+
+- 生成完成后在后台上传，不影响接口响应；启动时会把本地已有的文件补传上去
+- `GET /v1/media/{name}` 本地缓存命中直接返回，否则 302 跳转到对象存储
+- 管理后台的媒体列表、删除同时覆盖本地和对象存储
+
 ## 🎞️ 参考素材：图片 / 视频 / 音频 / 文档
 
 生图、图像编辑、图片任务与视频接口都可以附带参考素材，限制与 muse.ai 网页端一致：

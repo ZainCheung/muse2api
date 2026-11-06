@@ -45,7 +45,7 @@ import zipfile
 from fastapi import Body, Depends, FastAPI, Header, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import (FileResponse, HTMLResponse, JSONResponse,
-                               Response, StreamingResponse)
+                               RedirectResponse, Response, StreamingResponse)
 from pydantic import model_validator, BaseModel, Field, SecretStr, field_validator
 
 from config import CFG
@@ -56,6 +56,7 @@ from engine import (ESSENTIAL_COOKIES, MAX_REFERENCE_IMAGE_BYTES,
 from engine import MuseProxyError
 from store import Store, account_expiry, min_expiry
 from proxy import normalize_server, request_proxy_context, split_proxy_url
+from storage import MediaStorage, safe_name
 
 import sys
 log = logging.getLogger("muse2api")
@@ -86,6 +87,8 @@ app.add_middleware(CORSMiddleware,
 
 store = Store(CFG)
 engine = MuseEngine(CFG)
+# 生成媒体存储：本地 data/media，可选同步到 S3 兼容对象存储（R2/S3）
+media_store = MediaStorage(CFG.media_dir)
 engine.proxy_resolver = lambda aid: (store.get_account(aid) or {}).get("proxy")
 
 
@@ -1177,6 +1180,7 @@ def _run_generation_locked(prompt: str, kind: str, timeout: int,
                                       reference_image=reference_image, **engine_kwargs)
                 store.mark(cur_acc["id"], True, "")
                 _sync_cookies(cur_acc["id"])
+                media_store.publish(res.get("path"), res.get("filename"))
                 return res, cur_acc["id"]
             except MuseAuthError as exc:
                 last_exc = exc
@@ -1831,12 +1835,15 @@ async def responses_api(req: ResponsesRequest, _=Depends(auth)):
 
 @app.get("/v1/media/{name}")
 def get_media(name: str):
-    if "/" in name or "\\" in name or ".." in name:
+    if not safe_name(name):
         raise HTTPException(400, "非法文件名")
     p = os.path.join(CFG.media_dir, name)
-    if not os.path.isfile(p):
-        raise HTTPException(404, "文件不存在")
-    return FileResponse(p)
+    if os.path.isfile(p):
+        return FileResponse(p)
+    # 本地缓存已清理：跳转到对象存储（公开域名或短期预签名地址）
+    if media_store.enabled and media_store.remote_exists(name):
+        return RedirectResponse(media_store.remote_url(name), status_code=302)
+    raise HTTPException(404, "文件不存在")
 
 
 # ------------------------- 管理：总览 -------------------------
@@ -1847,8 +1854,9 @@ def admin_status(_=Depends(auth)):
         "accounts": store.list_accounts(),
         "stats": store.stats(),
         "tasks": store.list_tasks(20),
-        "media_count": len(os.listdir(CFG.media_dir))
-        if os.path.isdir(CFG.media_dir) else 0,
+        "media_count": len(media_store.list_all()) if media_store.enabled
+        else (len(os.listdir(CFG.media_dir)) if os.path.isdir(CFG.media_dir) else 0),
+        "storage": media_store.describe(),
         "browser_running": bool(engine.proc and engine.proc.poll() is None),
         "essential_cookies": list(ESSENTIAL_COOKIES),
         "base_url": f"{base}/v1" if base else "",
@@ -2259,19 +2267,8 @@ def clear_tasks(payload: dict = Body(default={}), _=Depends(auth)):
 
 @app.get("/admin/media")
 def admin_media(_=Depends(auth)):
-    d = CFG.media_dir
-    items = []
-    if os.path.isdir(d):
-        for name in os.listdir(d):
-            p = os.path.join(d, name)
-            if not os.path.isfile(p):
-                continue
-            ext = os.path.splitext(name)[1].lower()
-            items.append({"name": name, "url": media_url(name), "bytes": os.path.getsize(p),
-                          "mtime": int(os.path.getmtime(p)),
-                          "kind": "video" if ext in (".mp4", ".webm", ".mov") else "image"})
-    items.sort(key=lambda x: x["mtime"], reverse=True)
-    return {"media": items, "count": len(items)}
+    items = [{**it, "url": media_url(it["name"])} for it in media_store.list_all()]
+    return {"media": items, "count": len(items), "storage": media_store.describe()}
 
 
 @app.post("/admin/media/delete")
@@ -2281,35 +2278,32 @@ def delete_media(payload: dict = Body(default={}), _=Depends(auth)):
         names = [names]
     if not isinstance(names, list):
         raise HTTPException(400, "names 必须是文件名数组")
-    d = CFG.media_dir
     removed = 0
     errors = []
     for name in names:
-        if not isinstance(name, str) or "/" in name or "\\" in name or ".." in name:
+        if not isinstance(name, str) or not safe_name(name):
             errors.append(f"非法文件名: {name}")
             continue
-        p = os.path.join(d, name)
-        if os.path.isfile(p):
-            try:
-                os.remove(p)
+        try:
+            if media_store.delete(name):
                 removed += 1
-            except OSError as e:
-                errors.append(f"{name}: {str(e)}")
+        except Exception as e:  # noqa: BLE001
+            errors.append(f"{name}: {str(e)}")
     return {"removed": removed, "errors": errors}
 
 
 @app.delete("/admin/media/{name}")
 def delete_single_media(name: str, _=Depends(auth)):
-    if "/" in name or "\\" in name or ".." in name:
+    if not safe_name(name):
         raise HTTPException(400, "非法文件名")
-    p = os.path.join(CFG.media_dir, name)
-    if not os.path.isfile(p):
-        raise HTTPException(404, "文件不存在")
     try:
-        os.remove(p)
-        return {"status": "ok", "deleted": name}
-    except OSError as e:
+        if not media_store.delete(name):
+            raise HTTPException(404, "文件不存在")
+    except HTTPException:
+        raise
+    except Exception as e:  # noqa: BLE001
         raise HTTPException(500, f"删除失败: {e}")
+    return {"status": "ok", "deleted": name}
 
 
 # ------------------------- 前端页面 -------------------------
@@ -2848,6 +2842,9 @@ async def _startup():
         _persist_env("MUSE2API_KEY", new_key)
         log.info("🔑 未检测到 MUSE2API_KEY，已自动生成初始密钥: %s", new_key)
     asyncio.create_task(_keepalive_loop())
+    media_store.start_maintenance()
+    if media_store.enabled:
+        log.info("🪣 媒体对象存储已启用: %s", media_store.describe())
 
 
 @app.on_event("shutdown")
