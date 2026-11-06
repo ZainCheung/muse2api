@@ -334,6 +334,22 @@ curl -X POST "http://localhost:18610/v1/images/edits" \
 
 ---
 
+## 🔐 Cloudflare Access 登录（可选）
+
+把管理后台放在 [Cloudflare Access](https://developers.cloudflare.com/cloudflare-one/applications/) 后面后，配置下面三项，
+允许列表中的邮箱登录 Cloudflare 后打开管理页即可使用，**无需在浏览器里填 API Key**：
+
+| 变量 | 说明 |
+|---|---|
+| `MUSE2API_ACCESS_TEAM_DOMAIN` | 团队域名，如 `yourteam.cloudflareaccess.com` |
+| `MUSE2API_ACCESS_AUD` | Access 应用的 Application Audience (AUD) Tag |
+| `MUSE2API_ACCESS_ALLOWED_EMAILS` | 允许的邮箱，逗号分隔 |
+| `MUSE2API_KEY_LOCKED` | 设为 `1` 时 Key 只能通过环境变量修改，后台「重新生成」被禁用 |
+
+- 服务端会**校验 JWT 签名**、audience、issuer 与过期时间，并核对邮箱；绕过 Cloudflare 直连服务器伪造请求头无效
+- 三项任一为空时功能关闭，只接受 API Key
+- API 调用方（以及浏览器扩展导入账号）照常使用 `Authorization: Bearer <key>`；扩展用的 `/admin/accounts` 需要在 Access 中设为 Bypass
+
 ## 🪣 媒体对象存储（S3 / Cloudflare R2）
 
 默认生成的图片和视频只保存在 `data/media`。设置 `MUSE2API_STORAGE=s3` 后会同步到任意 S3 兼容的对象存储：

@@ -37,6 +37,7 @@ import json
 import logging
 import os
 import re
+import secrets
 import threading
 import time
 import uuid
@@ -57,6 +58,7 @@ from engine import MuseProxyError
 from store import Store, account_expiry, min_expiry
 from proxy import normalize_server, request_proxy_context, split_proxy_url
 from storage import MediaStorage, safe_name
+from access import AccessVerifier
 
 import sys
 log = logging.getLogger("muse2api")
@@ -89,6 +91,10 @@ store = Store(CFG)
 engine = MuseEngine(CFG)
 # 生成媒体存储：本地 data/media，可选同步到 S3 兼容对象存储（R2/S3）
 media_store = MediaStorage(CFG.media_dir)
+# 管理后台可放在 Cloudflare Access 后面：验证其签发的 JWT 后免填 API Key
+access = AccessVerifier()
+# Key 由部署环境变量统一管理时（例如 Dokploy 注入、下游项目共用），禁止在后台轮换
+KEY_LOCKED = os.environ.get("MUSE2API_KEY_LOCKED", "").strip() == "1"
 engine.proxy_resolver = lambda aid: (store.get_account(aid) or {}).get("proxy")
 
 
@@ -320,16 +326,25 @@ def resolve_model(name: str | None, default: str = "muse-image") -> str:
 
 
 # ------------------------- 鉴权 -------------------------
-def auth(authorization: str | None = Header(default=None)):
-    if not CFG.api_key:
-        return True
+def _bearer_ok(authorization: str | None) -> bool:
     if not authorization or not authorization.lower().startswith("bearer "):
-        raise HTTPException(401, "缺少 Authorization: Bearer <key>")
+        return False
     parts = authorization.split(None, 1)
     token = parts[1].strip() if len(parts) > 1 else ""
-    if not token or token != CFG.api_key:
-        raise HTTPException(401, "API key 无效")
-    return True
+    return bool(token) and secrets.compare_digest(token, CFG.api_key)
+
+
+def auth(request: Request, authorization: str | None = Header(default=None)):
+    """API Key，或经过签名校验的 Cloudflare Access 登录（仅允许列表中的邮箱）。"""
+    if not CFG.api_key:
+        return True
+    if _bearer_ok(authorization):
+        return True
+    if access.email_from_request(request.headers, request.cookies):
+        return True
+    if not authorization:
+        raise HTTPException(401, "缺少 Authorization: Bearer <key>")
+    raise HTTPException(401, "API key 无效")
 
 
 # ------------------------- 请求模型 -------------------------
@@ -2155,15 +2170,29 @@ def _public_base() -> str:
 def get_apikey(_=Depends(auth)):
     base = _public_base()
     base_url = f"{base}/v1" if base else ""
-    return {"api_key": CFG.api_key, "base_url": base_url,
+    return {"api_key": CFG.api_key, "base_url": base_url, "key_locked": KEY_LOCKED,
             "models_url": f"{base}/v1/models" if base else "",
             "media_url": f"{base}/v1/media/{{name}}" if base else "/v1/media/{name}"}
+
+
+@app.get("/admin/session")
+def admin_session(request: Request, authorization: str | None = Header(default=None)):
+    """管理页启动时调用：告诉前端当前是否已登录、通过哪种方式。不需要鉴权。"""
+    email = access.email_from_request(request.headers, request.cookies)
+    if email:
+        return {"authenticated": True, "via": "cloudflare-access", "email": email,
+                "key_locked": KEY_LOCKED}
+    ok = (not CFG.api_key) or _bearer_ok(authorization)
+    return {"authenticated": ok, "via": "api-key" if ok else None,
+            "access_enabled": access.enabled, "key_locked": KEY_LOCKED}
 
 
 @app.post("/admin/apikey/rotate")
 def rotate_apikey(_=Depends(auth)):
     """生成新的 API Key，写入 .env 并立即生效（不用重启）。"""
-    import secrets
+    if KEY_LOCKED:
+        raise HTTPException(409, "API Key 由服务器环境变量统一管理（MUSE2API_KEY_LOCKED=1），"
+                                 "请在部署平台中修改 MUSE2API_KEY 后重新部署")
     new_key = "m2a_" + secrets.token_hex(24)
     old = CFG.api_key
     CFG.api_key = new_key
