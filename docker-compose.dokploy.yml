@@ -1,0 +1,42 @@
+# Dokploy 部署用（Compose 类型）。环境变量在 Dokploy 的 Environment 中配置：
+#   MUSE2API_KEY（必填，调用方与管理后台使用的 Key）、MUSE2API_PUBLIC_BASE（对外地址，可选）
+# 域名在 Dokploy 中绑定到服务 muse2api 的 18610 端口；不暴露宿主机端口。
+# 同一台服务器上的其他应用通过 dokploy-network 以 http://deepoke-muse2api:18610 访问。
+services:
+  muse2api:
+    build: .
+    restart: unless-stopped
+    environment:
+      MUSE2API_KEY: ${MUSE2API_KEY:?MUSE2API_KEY is required}
+      MUSE2API_PUBLIC_BASE: ${MUSE2API_PUBLIC_BASE:-}
+      MUSE2API_IMAGE_TIMEOUT: ${MUSE2API_IMAGE_TIMEOUT:-240}
+      MUSE2API_VIDEO_TIMEOUT: ${MUSE2API_VIDEO_TIMEOUT:-600}
+      MUSE2API_CHAT_TIMEOUT: ${MUSE2API_CHAT_TIMEOUT:-300}
+      MUSE2API_CONCURRENCY: ${MUSE2API_CONCURRENCY:-2}
+      TZ: Asia/Shanghai
+    volumes:
+      # 账号、任务记录与生成的媒体
+      - muse2api-data:/app/data
+      # Chromium 用户目录（保留登录态，重启不用重新登录）
+      - muse2api-profiles:/root/muse2api-profiles
+    # Chromium 多标签页渲染需要足够的 /dev/shm
+    shm_size: "1gb"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:18610/healthz"]
+      interval: 30s
+      timeout: 5s
+      start_period: 60s
+      retries: 3
+    networks:
+      default:
+      dokploy-network:
+        aliases:
+          - deepoke-muse2api
+
+volumes:
+  muse2api-data:
+  muse2api-profiles:
+
+networks:
+  dokploy-network:
+    external: true
